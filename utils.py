@@ -6,7 +6,7 @@ def getHashString(s):
     return hashlib.sha256(s.encode('utf8')).hexdigest()
 
 def checkHash(hash):
-    return hash[0:1] == "0"
+    return hash[0:5] == "00000"
 
 def generateUUID():
     u = list(os.urandom(16))
@@ -17,3 +17,6 @@ def generateUUID():
 
 def generateNonce():
     return "{:08}".format(random.randint(0, 99999999))
+
+def checkUserId(userId):
+    return isinstance(userId, str) and len(userId) == 8

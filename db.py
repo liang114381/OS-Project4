@@ -3,7 +3,7 @@ import json
 from utils import *
 import threading
 import logging
-import sqlite3
+import time
 
 
 class Balances(dict):
@@ -21,7 +21,7 @@ class Block:
 
     def __init__(self, block=None):
         if isinstance(block, db_pb2.Block):
-            self.BlockID = block.BlockID
+            self.BlockID = int(block.BlockID)
             self.PrevHash = block.PrevHash
             self.MinerID = block.MinerID
             self.Nonce = block.Nonce
@@ -88,6 +88,7 @@ class Transaction:
             self.Value = trans.Value
             self.MiningFee = trans.MiningFee
             self.UUID = trans.UUID
+            self.time = None
         elif isinstance(trans, str):
             self.fromJson(trans)
 
@@ -110,6 +111,7 @@ class Transaction:
         self.Value = J['Value']
         self.MiningFee = J['Value']
         self.UUID = J['UUID']
+        self.time = None
 
 
 class BlockChain:
@@ -139,17 +141,17 @@ class BlockChain:
                 block = Block(f.read())
                 if not self.append(block, False):
                     break
-                logging.debug('loaded block {}'.format(block.BlockID))
+                logging.info('loaded block {}'.format(block.BlockID))
                 cur += 1
             except IOError:
                 break
 
     def append(self, block, writeToFile=True):
         if len(self.chain) == 0:
-            if block.PrevHash != self.NullHash:
+            if block.PrevHash != self.NullHash or block.BlockID != 1:
                 return False
         else:
-            if self.chain[-1].hash != block.PrevHash:
+            if self.chain[-1].hash != block.PrevHash or block.BlockID != len(self.chain) + 1:
                 return False
 
         tmpBalances = Balances(0)
@@ -158,10 +160,13 @@ class BlockChain:
             if trans.UUID in transSet or trans.UUID in self.transDepth:
                 return False
             transSet.add(trans.UUID)
-            if trans.Value < trans.MiningFee or trans.MiningFee <=0:
+            if trans.Value < trans.MiningFee or trans.MiningFee <= 0:
+                return False
+            if not checkUserId(trans.FromID) or not checkUserId(trans.ToID):
                 return False
             tmpBalances[trans.FromID] -= trans.Value
             tmpBalances[trans.ToID] += trans.Value - trans.MiningFee
+            tmpBalances[block.MinerID] += trans.MiningFee
             if self.balances[trans.FromID] + tmpBalances[trans.FromID] < 0 \
                     or self.balances[trans.ToID] + tmpBalances[trans.ToID] < 0:
                 return False
@@ -171,14 +176,12 @@ class BlockChain:
             self.transDepth[trans.UUID] = block.BlockID
             self.balances[trans.FromID] -= trans.Value
             self.balances[trans.ToID] += trans.Value - trans.MiningFee
+            self.balances[block.MinerID] += trans.MiningFee
 
         if self.dataDir is not None and writeToFile:
             with open(os.path.join(self.dataDir, str(block.BlockID) + '.json'), 'w') as f:
                 f.write(block.toJson())
         return True
-
-    def transExist(self, trans):
-        return trans.UUID in self.transDepth
 
     def writeToFile(self, dataDir):
         # for f in glob.glob(os.path.join(dataDir, '*.json')):
@@ -191,28 +194,47 @@ class BlockChain:
 
 class TransientLogManager:
     def __init__(self, dataDir):
-        self.logPath = os.path.join(dataDir, 'transient.log')
+        self.logDir = os.path.join(dataDir, 'transientLogs')
+        if not os.path.isdir(self.logDir):
+            os.makedirs(self.logDir)
         self.transientTransList = []
         self.transientTransByUUID = {}
+        self.updateLock = threading.Lock()
 
-        if os.path.isfile(self.logPath):
-            f = open(self.logPath, 'r')
-            lines = f.readlines()
-            for line in lines:
-                trans = Transaction(line)
+        for filePath in os.listdir(self.logDir):
+            with open(os.path.join(self.logDir, filePath), 'r') as f:
+                lines = f.readlines()
+                trans = Transaction(lines[0])
+                trans.time = float(lines[1])
                 self.transientTransList.append(trans)
                 self.transientTransByUUID[trans.UUID] = trans
-            f.close()
-
-            self.logFile = open(self.logPath, 'a')
-        else:
-            self.logFile = open(self.logPath, 'w')
+        self.transientTransList.sort(key=lambda t: t.time)
 
     def logTransfer(self, trans):
-        self.transientTransList.append(trans)
-        self.transientTransByUUID[trans.UUID] = trans
-        self.logFile.write(trans.toJson().strip() + '\n')
-        self.logFile.flush()
+        with self.updateLock:
+            if trans.UUID in self.transientTransByUUID:
+                return False
+            self.transientTransList.append(trans)
+            self.transientTransByUUID[trans.UUID] = trans
+            logFilePath = self.getLogFilePath(trans.UUID)
+            with open(logFilePath, 'w') as f:
+                f.write(trans.toJson().strip() + '\n' + str(time.time()))
+            return True
+
+    def getLogFilePath(self, UUID):
+        return os.path.join(self.logDir, UUID + '.log')
+
+    def removeTransfer(self, UUID):
+        with self.updateLock:
+            if UUID in self.transientTransByUUID:
+                self.transientTransList.remove(self.transientTransByUUID[UUID])
+                del self.transientTransByUUID[UUID]
+                try:
+                    logFilePath = self.getLogFilePath(UUID)
+                    os.remove(logFilePath)
+                    logging.debug('removed transient log file {}'.format(logFilePath))
+                except IOError:
+                    pass
 
 
 class DBEngine:
@@ -248,33 +270,30 @@ class DBEngine:
         return self.curChain.balances[userId]
 
     def verify(self, trans):
-        if trans.UUID in self.transManager.transientTransByUUID:
-            return 'PENDING'
-        if trans.UUID not in self.curChain.transDepth:
-            return 'FAILED'
-        if self.curChain.transDepth[trans.UUID] < len(self.curChain) - 6:
+        if self.transVerified(trans):
             return 'SUCCEEDED'
+        if not self.transExist(trans) and \
+            trans.UUID not in self.transManager.transientTransByUUID:
+            return 'FAILED'
         return 'PENDING'
 
     def pushTransaction(self, trans):
-        fromId = trans.FromID
-        toId = trans.ToID
-        value = trans.Value
-        fee = trans.MiningFee
-        # if self.transientBalances[fromId] < value:
-        #     logging.debug("Transfer from {} to {} failed!".format(fromId, toId))
-        #     return False
-        if fromId == toId:
-            logging.debug("Cannot transfer from one user to the same one!")
-            return False
-        # self.transientBalances[fromId] -= value
-        # self.transientBalances[toId] += value - fee
-        self.transManager.logTransfer(trans)
+        with self.updateLock:
+            if trans.FromID == trans.ToID:
+                return False
+            if trans.MiningFee <= 0 or trans.MiningFee >= trans.Value:
+                return False
+            self.transManager.logTransfer(trans)
+            return True
 
     def addBlock(self, block):
-        self.blocks[block.hash] = block
-        self.curChain.append(block)
-        return True
+        with self.updateLock:
+            self.blocks[block.hash] = block
+            self.curChain.append(block)
+
+    def removeBlock(self, block):
+        with self.updateLock:
+            del self.blocks[block.hash]
 
     def getHeight(self):
         return len(self.curChain)
@@ -290,47 +309,80 @@ class DBEngine:
         return self.getBlockByHash(self.blocks[blockHash].BlockID)
 
     def updateLongestBlockChain(self):
-        if len(self.blocks) == 0:
-            return
-
         with self.updateLock:
-            maxLength, minHash, selectedBlock = -1, None, None
-            for hash, block in self.blocks.items():
-                self.getDepthByBlockHash(block.hash)
-                if block.BlockID > maxLength:
-                    maxLength = block.BlockID
-                    minHash = block.hash
-                    selectedBlock = block
-                elif block.BlockID == maxLength and block.hash < minHash:
-                    minHash = block.hash
-                    selectedBlock = block
-            chain = []
             while True:
-                chain.append(selectedBlock)
-                if selectedBlock.PrevHash == BlockChain.NullHash:
+                if len(self.blocks) == 0:
+                    return
+                maxLength, minHash, selectedBlock = -1, None, None
+                for hash, block in self.blocks.items():
+                    self.getDepthByBlockHash(block.hash)
+                    if block.BlockID > maxLength:
+                        maxLength = block.BlockID
+                        minHash = block.hash
+                        selectedBlock = block
+                    elif block.BlockID == maxLength and block.hash < minHash:
+                        minHash = block.hash
+                        selectedBlock = block
+                if len(self.curChain) != 0 and selectedBlock.hash == self.curChain.chain[-1].hash:
+                    return
+                chain = []
+                valid = True
+                while valid:
+                    chain.append(selectedBlock)
+                    if selectedBlock.PrevHash == BlockChain.NullHash:
+                        break
+                    try:
+                        prevBlock = self.blocks[selectedBlock.PrevHash]
+                        if selectedBlock.BlockID != prevBlock.BlockID + 1:
+                            valid = False
+                        selectedBlock = prevBlock
+                    except KeyError:
+                        valid = False
+                if not valid:
+                    for block in chain:
+                        self.removeBlock(block)
+                else:
                     break
-                selectedBlock = self.blocks[selectedBlock.PrevHash]
+
             self.curChain = BlockChain(self.dataDir, loadFromDir=False)
             for block in reversed(chain):
                 self.curChain.append(block)
 
-    def packToBlock(self):
-        transactions = []
-        for trans in self.transManager.transientTransList:
-            # print('len of curchain', len(self.curChain))
-            if not self.curChain.transExist(trans):
-                transactions.append(trans)
-                if len(transactions) >= self.TRANS_IN_BLOCK:
-                    break
-        # print(len(transactions))
-        if len(transactions) == 0:
-            return None
-        block = Block()
-        block.BlockID = len(self.curChain) + 1
-        block.MinerID = 'Server1'
-        block.Transactions = transactions
-        if len(self.curChain) == 0:
-            block.PrevHash = BlockChain.NullHash
-        else:
-            block.PrevHash = self.curChain[-1].hash
-        return block
+    def packToBlock(self, minerId):
+        with self.updateLock:
+            transactions = []
+            tmpBalances = Balances(0)
+            for trans in self.transManager.transientTransList:
+                if not self.transExist(trans):
+                    tmpBalances[trans.FromID] -= trans.Value
+                    if self.curChain.balances[trans.FromID] + tmpBalances[trans.FromID] < 0:
+                        tmpBalances[trans.FromID] += trans.Value
+                        self.transManager.removeTransfer(trans.UUID)
+                    tmpBalances[trans.ToID] += trans.Value - trans.MiningFee
+                    tmpBalances[minerId] += trans.MiningFee
+                    transactions.append(trans)
+                    if len(transactions) >= self.TRANS_IN_BLOCK:
+                        break
+                elif self.transVerified(trans):
+                    self.transManager.removeTransfer(trans.UUID)
+            if len(transactions) == 0:
+                return None
+            block = Block()
+            block.BlockID = len(self.curChain) + 1
+            block.MinerID = minerId
+            block.Transactions = transactions
+            if len(self.curChain) == 0:
+                block.PrevHash = BlockChain.NullHash
+            else:
+                block.PrevHash = self.curChain[-1].hash
+            return block
+
+    def transExist(self, trans):
+        return trans.UUID in self.curChain.transDepth
+
+    def transVerified(self, trans):
+        return trans.UUID in self.curChain.transDepth and\
+               self.curChain.transDepth[trans.UUID] <= len(self.curChain) - 6
+
+    def blockByTrans(self, trans):
+        return self.curChain[self.curChain.transDepth[trans.UUID] - 1]

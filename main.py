@@ -6,15 +6,16 @@ import time
 from concurrent import futures
 from server import BlockChainServer
 import db_pb2_grpc
+import signal
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Run some server')
     parser.add_argument('--id', action='store')
     args = parser.parse_args()
-    serverId = args.id
+    serverId = int(args.id)
 
-    logging.basicConfig(level=logging.DEBUG,
+    logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s, %(levelname)s: Server{} %(message)s'.format(serverId))
 
     config = json.loads(open('config.json').read())
@@ -38,7 +39,6 @@ if __name__ == '__main__':
     grpcServer.start()
 
     try:
-        while True:
-            time.sleep(1)
+        signal.pause()
     except KeyboardInterrupt:
         grpcServer.stop()
